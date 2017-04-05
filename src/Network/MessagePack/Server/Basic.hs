@@ -53,10 +53,13 @@ module Network.MessagePack.Server.Basic (
   , serve
   ) where
 
-import           Control.Applicative                    (Applicative, pure,
+import           Control.Applicative                    (Alternative (..),
+                                                         Applicative, pure,
                                                          (<$>), (<|>))
-import           Control.Monad.Catch                    (MonadCatch, MonadThrow,
-                                                         catch, throwM)
+import           Control.Monad.Catch                    (Handler (..),
+                                                         MonadCatch, MonadThrow,
+                                                         SomeException, catch,
+                                                         catches, throwM)
 import           Control.Monad.Trans                    (MonadIO, MonadTrans,
                                                          lift, liftIO)
 import           Control.Monad.Trans.Control            (MonadBaseControl)
@@ -70,10 +73,11 @@ import           Data.Conduit.Network                   (appSink, appSource,
                                                          serverSettings,
                                                          setAfterBind)
 import           Data.Conduit.Serialization.Binary      (ParseError, sinkGet)
+import           Data.Either
 import qualified Data.List                              as List
 import           Data.MessagePack                       (MessagePack, Object,
                                                          fromObject, toObject)
-import qualified Data.MessagePack.Result                as R
+-- import qualified Data.MessagePack.Result                as R
 import           Data.Monoid                            ((<>))
 import           Data.Text                              (Text)
 import qualified Data.Text                              as T
@@ -102,14 +106,14 @@ type Server = ServerT IO
 instance (MonadThrow m, MessagePack o, MethodType m r) => MethodType m (o -> r) where
   toBody n f (x : xs) =
     case fromObject x of
-      Nothing -> throwM $ ServerError "argument type error"
+      Nothing -> throwM $ methodError "argument type error"
       Just r  -> toBody n (f r) xs
-  toBody _ _ [] = error "messagepack-rpc methodtype instance toBody failed"
+  toBody _ _ [] = throwM $ methodError "not enough arguments"
 
 instance (Functor m, MonadThrow m, MessagePack o) => MethodType m (ServerT m o) where
   toBody _ m [] = toObject <$> runServerT m
   toBody n _ ls =
-    throwM $ ServerError $
+    throwM $ methodError $
       "invalid arguments for method '" <> n <> "': " <> T.pack (show ls)
 
 -- Pure server
@@ -134,19 +138,27 @@ processRequests
   -> Sink S.ByteString m t
   -> m b
 processRequests methods rsrc sink = do
-  (rsrc', res) <-
-    rsrc $$++ do
-      obj <- sinkGet Binary.get
-      case unpackRequest obj of
-        Nothing ->
-          throwM $ ServerError "invalid request"
-        Just req@(_, msgid, _, _) ->
-          lift $ getResponse methods req `catch` \(ServerError err) ->
-            return (1, msgid, toObject err, toObject ())
+  (rsrc', res) <- rsrc $$++ do
+    obj <- sinkGet Binary.get
+    case unpackRequest obj of
+      Nothing ->
+        throwM $ internalError "invalid request"
+      Just req@(_, msgid, _, _) ->
+        let
+            handlers = [ Handler $ return . handleServerError msgid
+                       , Handler $ return . handleAnyError msgid ]
+        in lift $ getResponse methods req `catches` handlers
 
   _ <- CB.sourceLbs (packResponse res) $$ sink
   processRequests methods rsrc' sink
 
+  where
+    handleServerError :: Int -> ServerError -> Response
+    handleServerError msgid err = (1, msgid, toObject err, toObject ())
+
+    handleAnyError :: Int -> SomeException -> Response
+    handleAnyError msgid exc = let err = internalError $ T.pack $ show exc
+                                in (1, msgid, toObject err, toObject ())
 
 getResponse
   :: Applicative m
@@ -156,11 +168,14 @@ getResponse
 getResponse methods (0, msgid, mth, args) =
   process <$> callMethod methods mth args
   where
-    process (R.Failure err) = (1, msgid, toObject err, toObject ())
-    process (R.Success ok ) = (1, msgid, toObject (), ok)
+    process (Left  err) = (1, msgid, toObject err, toObject ())
+    process (Right ok ) = (1, msgid, toObject (), ok)
+    -- process (R.Failure err) = (1, msgid, toObject err, toObject ())
+    -- process (R.Success ok ) = (1, msgid, toObject (), ok)
 
 getResponse _ (rtype, msgid, _, _) =
-  pure (1, msgid, toObject ["request type is not 0, got " <> T.pack (show rtype)], toObject ())
+  let err = internalError $ "request type is not 0, got " <> T.pack (show rtype)
+  in pure (1, msgid, toObject err, toObject ())
 
 
 callMethod
@@ -168,22 +183,22 @@ callMethod
   => [Method m]
   -> Object
   -> [Object]
-  -> m (R.Result Object)
-callMethod methods mth args = sequenceA $
-  (stringCall =<< fromObject mth)
-  <|>
-  (intCall =<< fromObject mth)
-
+  -> m (Either ServerError Object)
+  -- -> m (Either ServerError Object)
+callMethod methods mth args = sequenceA
+    (stringCall =<< fromObject mth)
+    -- <|>
+    -- (intCall =<< fromObject mth)
   where
     stringCall name =
       case List.find ((== name) . methodName) methods of
-        Nothing -> R.Failure $ "method '" <> T.unpack name <> "' not found"
-        Just m  -> R.Success $ methodBody m args
+        Nothing -> Left  $ methodNotFoundError name
+        Just m  -> Right $ methodBody m args
 
-    intCall ix =
-      case drop ix methods of
-        []  -> R.Failure $ "method #" <> show ix <> " not found"
-        m:_ -> R.Success $ methodBody m args
+    -- intCall ix =
+    --   case drop ix methods of
+    --     []  -> Left  $ methodNotFoundError $ "#" <> T.pack (show ix)
+    --     m:_ -> Right $ methodBody m args
 
 
 ignoreParseError :: Applicative m => ParseError -> m ()
